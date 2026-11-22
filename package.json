@@ -1,0 +1,22 @@
+{
+  "name": "brac-nano-loan-qa",
+  "version": "1.0.0",
+  "description": "BRAC Microfinance Nano Loan Eligibility & Credit Score QA Verification Tool",
+  "main": "check_member.js",
+  "scripts": {
+    "start": "node check_member.js",
+    "check": "node check_member.js"
+  },
+  "keywords": [
+    "brac",
+    "nano-loan",
+    "qa",
+    "credit-risk",
+    "eligibility"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
