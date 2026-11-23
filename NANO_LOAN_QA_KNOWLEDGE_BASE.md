@@ -14,6 +14,10 @@
 | **Database Host** | `10.150.150.52:4550` | EnterpriseDB PostgreSQL 15.7 |
 | **Database Name** | `sbicloud_bd` | Main Core Banking DB |
 | **Database User** | `aditya_2344` | QA / Read-only DB User |
+| **Branch Office [0459] ID** | `578` (`BD400459` - Joypurhat) | Configured as `office.id` in `config/config.properties` |
+
+> [!TIP]
+> **Externalized Properties & Live Config Verification**: All environment URLs, `office.id`, `loan.product.dabi.id`, `loan.product.progoti.id`, branch/HO credentials, and DB connection parameters are centralized in `config/config.properties`. On every execution, the QA engine dynamically queries `loan_product`, `project_loan_product_mapping`, `loan_product_interest_rate`, `loan_product_policy`, `loan_product_details`, and all active `credit_risk_model_conf_*` tables for both Dabi and Progoti products and verifies the evaluated member's project against the matching configured loan product.
 
 > [!IMPORTANT]
 > **Performance & Partitioning Rule**: Core transaction tables (`loan_account_transaction`, `savings_account_transaction`, `loan_collection`) are physically partitioned by `office_info_id`. Always include `office_info_id` in SQL `WHERE` clauses to enable partition pruning; omitting `office_info_id` triggers full table scans across millions of rows.

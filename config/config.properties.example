@@ -1,0 +1,31 @@
+# ==============================================================================
+# BRAC Microfinance Nano Loan QA - Configuration Properties (Example Template)
+# ==============================================================================
+# Copy this file to config/config.properties and update with your environment values.
+
+# ERP Application & Environment
+base.url=https://env102-erp.bracits.net
+loan.product.dabi.id=235
+loan.product.progoti.id=234
+
+# Office & Branch Configuration
+office.id=578
+branch.office.code=0459
+branch.username=YOUR_BRANCH_USERNAME
+branch.password=YOUR_BRANCH_PASSWORD
+
+# Head Office Credentials
+head.office.username=YOUR_HO_USERNAME
+head.office.password=YOUR_HO_PASSWORD
+
+# Database Configuration
+db.host=10.150.150.52
+db.port=4550
+db.name=sbicloud_bd
+db.user=YOUR_DB_USER
+db.password=YOUR_DB_PASSWORD
+db.connection.timeout.ms=10000
+
+# Evaluation Options (Optional Overrides)
+evaluation.business.date=
+eligibility.run.id=latest

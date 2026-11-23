@@ -1,181 +1,25 @@
 # BRAC Nano Loan Eligibility & Credit Score QA Verification Tool
 
-A specialized JavaScript / Node.js automated QA verification engine for the **BRAC Microfinance Nano Loan Project** (CR ID: `BBMFV2-7826`). 
+A modular Node.js automated QA verification engine for the **BRAC Microfinance Nano Loan Project** (CR ID: `BBMFV2-7826`).
 
-This tool evaluates any BRAC member's loan and savings history against the 5-stage Nano Loan eligibility criteria and 4 credit scoring parameters specified in the Change Request Document (SRS). It provides a full step-by-step mathematical calculation breakdown and performs automated side-by-side reconciliation against the system batch run tables in the database.
+This tool evaluates any BRAC member's loan and savings history against the 5-stage Nano Loan eligibility criteria and 4 credit scoring parameters specified in the Change Request Document (SRS). On **every run**, it reads externalized settings from `config/config.properties` and fetches the **live Loan Product configuration** (by `loan.product.id`) and **live Credit Risk Model rules** directly from the database before computing the full step-by-step breakdown and reconciling against the latest batch run tables.
 
 ---
 
-## 📌 Features
+## 📌 Key Features
 
+- **Externalized Configuration (`config/config.properties`)**:
+  - Centralized properties file for `base.url`, `loan.product.dabi.id` (`235`), `loan.product.progoti.id` (`234`), `office.id`, `branch.office.code`, branch credentials (`branch.username` / `branch.password`), head office credentials (`head.office.username` / `head.office.password`), and PostgreSQL DB settings.
+- **Live Loan Product & Assessment Rule Verification (Every Run)**:
+  - Queries `loan_product`, `project_loan_product_mapping`, `loan_product_interest_rate`, `loan_product_policy`, and `loan_product_details` live on every execution for **both Dabi and Progoti** loan products, verifying that each product is active and mapped to its project, and matching the evaluated member's project to the corresponding product.
+  - Queries all active (`domain_status_id = 1`) `credit_risk_model_conf_*` tables live on every execution and flags any **Configuration Drift** versus the latest eligibility batch run snapshot.
 - **5-Stage Sequential Eligibility Evaluation**:
-  1. **Step 1: Minimum Loan Cycle**: Evaluates general loan counts within a 4-year history window (Monthly frequency, status 1 & 2).
-  2. **Step 2: Running Loan Repayment Requirement**: Calculates principal repaid percentage on the latest active loan ($\ge 30\%$ threshold; automatically skipped if no running loan exists).
-  3. **Step 3: Due Month Repayment Criteria**: Validates installment repayment timeliness within repayment months over the evaluation period (12 months).
-  4. **Step 4: Eligible Loan Ceiling Calculation**: Computes average disbursed amount of the latest 2 general loans $\times 20\%$, enforcing project-specific minimum and maximum caps (Dabi: BDT 20k–50k, Progoti: BDT 20k–100k).
-  5. **Step 5: Credit Scoring Assessment**: Computes individual loan scores and averages across 4 behavioral parameters:
-     - *Parameter 1*: Installment Payment Behavior (Timeliness per installment)
-     - *Parameter 2*: Savings Paid with Loan Installment (Compulsory savings deposit ratio)
-     - *Parameter 3*: Savings Adjustment of Previous Loans (Loan settlement via savings)
-     - *Parameter 4*: Savings Withdrawal Before Repayment (Compulsory savings withdrawals within 7 days of due date)
-     - *Final Score Formula*: $\frac{\text{Param 1} + \text{Param 2} + \text{Param 3} + \text{Param 4}}{4} \ge 3.0$
-- **Automated Database Reconciliation**: Automatically matches computed values against `credit_risk_model_eligible_member`, `credit_risk_model_eligibility_candidate`, and `credit_risk_model_eligibility_score_detail`.
-- **Dynamic Real-Time Calculation**: For members whose branch was not part of the previous batch run (e.g. Branch 391), computes eligibility directly from underlying core ERP tables.
-
----
-
-## 🛠️ Prerequisites
-
-1. **Node.js**: Version `18.x`, `20.x`, or higher installed.
-2. **Network / VPN Access**: The database host is on an internal network (`10.150.150.52:4550`). Ensure your VPN (e.g. OpenFortiVPN) is active when running against the live database.
-
----
-
-## 📥 Installation
-
-1. Navigate to the project directory:
-   ```bash
-   cd /home/a/Documents/bracNanoLoanProject
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-   *(Only requires the standard `pg` PostgreSQL client library).*
-
----
-
-## 🚀 How to Run
-
-### Option 1: Direct Command-Line Argument (Fastest)
-Pass the Member ID directly as a command-line argument:
-```bash
-node check_member.js <MEMBER_ID>
-```
-Or using npm:
-```bash
-npm run check -- <MEMBER_ID>
-```
-
-#### Examples:
-```bash
-# 1. Eligible Progoti Member (Ceiling capped at 100k, Final Score: 4.750)
-node check_member.js 16292015
-
-# 2. Eligible Dabi Member (Ceiling: 22k, Final Score: 4.000)
-node check_member.js 16273461
-
-# 3. Candidate Failed at Step 2 (Running loan repaid 22.4%, requires 30.0%)
-node check_member.js 14703103
-
-# 4. Candidate Failed at Step 4 (Computed ceiling 15,000 below project min 20,000)
-node check_member.js 14582259
-
-# 5. Member from Branch 391 (Sonagazi) - Real-time Core ERP Evaluation
-node check_member.js 34145511
-```
-
----
-
-### Option 2: Interactive Prompt Mode
-Run the script without arguments, and it will prompt you to enter a Member ID:
-```bash
-node check_member.js
-```
-**Terminal Output:**
-```text
-Please enter Member ID (e.g. 16273461, 34145511): 16292015
-```
-
----
-
-## 📋 Sample Terminal Output Breakdown
-
-```text
-================================================================================
-  BRAC NANO LOAN - MEMBER ELIGIBILITY & CREDIT SCORE QA BREAKDOWN
-================================================================================
-
-👤 MEMBER INFORMATION:
-  - Member ID        : 16292015
-  - Member Number    : 16292015
-  - Member Name      : Md Anser Ali Ali
-  - Branch Office    : [BD400223] Nangalkot (ID: 342)
-  - Project          : Progoti (ID: 2)
-  - Evaluation Date  : 2026-10-31
-  - Assessment Status: ✅ ELIGIBLE
-  - Min Loan Ceiling : BDT 20,000.00
-  - Max Loan Ceiling : BDT 100,000.00
-  - Final Score      : 4.750 (Threshold: 3)
-
---------------------------------------------------------------------------------
-  STEP 1: Minimum Loan Cycle Evaluation (Sequence 1)
---------------------------------------------------------------------------------
-  Configured Rule  : Minimum 2 General Loans within last 4 years (after 2022-10-31)
-  Actual Evaluated : 3 General Loans found
-  Step Verdict     : ✅ PASS
-
---------------------------------------------------------------------------------
-  STEP 2: Running Loan Repayment Requirement (Sequence 2)
---------------------------------------------------------------------------------
-  Status           : ℹ️ Member has no active running loan (all loans closed).
-  Rule Impact      : Step 2 criteria is automatically SKIPPED as per SRS business exception.
-  Step Verdict     : ✅ PASS (Skipped)
-
---------------------------------------------------------------------------------
-  STEP 3: Due Month Repayment Criteria (Sequence 3)
---------------------------------------------------------------------------------
-  Evaluation Period: Last 12 Months (since 2025-10-31)
-  Rule             : All repayments must be completed within the respective repayment month
-  Step Verdict     : ✅ PASS
-
---------------------------------------------------------------------------------
-  STEP 4: Eligible Loan Amount & Ceiling Calculation (Sequence 4)
---------------------------------------------------------------------------------
-  Number of Loans to Average : 2 loans
-  Loans Averaged             : 48449049 (BDT 600,000.00), 41939313 (BDT 500,000.00)
-  Average Disbursed Amount   : BDT 550,000.00
-  Eligible Loan Percentage   : 20%
-  Formula                    : Average Disbursed * 20%
-  Calculated Ceiling         : BDT 110,000.00
-  Project Ceiling Range      : BDT 20,000.00 - BDT 100,000.00
-  Step Verdict               : ✅ PASS
-  Final Min Eligible Amount  : BDT 20,000.00
-  Final Max Eligible Amount  : BDT 100,000.00 (Capped at Progoti max ceiling)
-
---------------------------------------------------------------------------------
-  STEP 5: Credit Risk Scoring & Final Score (Sequence 5)
---------------------------------------------------------------------------------
-  1. Installment Payment Behavior Score : 5.000
-  2. Savings Paid with Installment Score: 4.000
-  3. Savings Adjustment of Prev Loan    : 5.000
-  4. Savings Withdrawal Before Repayment: 5.000
-
-  Final Credit Score Calculation:
-  Formula          : (Param1 + Param2 + Param3 + Param4) / 4
-                   : (5.000 + 4.000 + 5.000 + 5.000) / 4
-  Final Score      : 4.750
-  Required Score   : >= 3
-  Step Verdict     : ✅ PASS
-
-================================================================================
-  QA DATABASE RECONCILIATION
-================================================================================
-  [Found in credit_risk_model_eligible_member table - Run ID: 2]
-  ---------------------------------------------------------------------
-  Metric                   | Engine Calculated  | Database Stored    | QA Match?
-  -------------------------+--------------------+--------------------+----------
-  Eligibility Status       | ELIGIBLE           | ELIGIBLE           | ✅ MATCH
-  Min Eligible Amount      | 20000              | 20000              | ✅ MATCH
-  Max Eligible Amount      | 100000             | 100000             | ✅ MATCH
-  Param 1 Score            | 5                  | 5                  | ✅ MATCH
-  Param 2 Score            | 4                  | 4                  | ✅ MATCH
-  Param 3 Score            | 5                  | 5                  | ✅ MATCH
-  Param 4 Score            | 5                  | 5                  | ✅ MATCH
-  Final Score              | 4.75               | 4.75               | ✅ MATCH
-================================================================================
-```
+  1. **Step 1: Minimum Loan Cycle** (General loan count within lookback window).
+  2. **Step 2: Running Loan Repayment Requirement** (Principal repaid % on latest active loan; auto-skipped if no running loan).
+  3. **Step 3: Due Month Repayment Criteria** (Repayment discipline over evaluation period).
+  4. **Step 4: Eligible Loan Ceiling Calculation** (Average disbursed amount of latest loans × eligible %, bounded by live Loan Product min/max ceilings).
+  5. **Step 5: Credit Scoring Assessment** (4 behavioral parameters evaluated against live DB score bands).
+- **Automated Database Reconciliation**: Side-by-side comparison against `credit_risk_model_eligible_member`, `credit_risk_model_eligibility_candidate`, and `credit_risk_model_eligibility_score_detail`.
 
 ---
 
@@ -183,30 +27,115 @@ Please enter Member ID (e.g. 16273461, 34145511): 16292015
 
 ```text
 bracNanoLoanProject/
-├── check_member.js               # CLI Entrypoint (interactive prompt or CLI args)
-├── nanoLoanEngine.js             # Core 5-stage calculation engine & scoring algorithms
-├── reporter.js                   # Output formatter, breakdown generator & DB reconciler
-├── db.js                         # Database pool connection configuration
-├── NANO_LOAN_QA_KNOWLEDGE_BASE.md# Comprehensive SRS business rules & DB schema reference
-├── package.json                  # Project dependencies & scripts
-├── 16072026_BBMFV2-7826...pdf    # Change Request Specification Document (SRS)
-└── README.md                     # Project documentation & usage instructions
+├── config/
+│   ├── config.properties              # Active environment, credentials, office & loan product ID
+│   └── config.properties.example      # Reference template for new environments
+├── src/
+│   ├── config/
+│   │   ├── propertiesParser.js        # Zero-dependency .properties file parser
+│   │   └── appConfig.js               # Typed configuration loader & URL builders
+│   ├── db/
+│   │   └── connection.js              # PostgreSQL Client/Pool factory driven by config.properties
+│   ├── services/
+│   │   ├── loanProductService.js      # Live DB loader for configured loan.product.id (rates, policies, tenures, project map)
+│   │   ├── assessmentConfigService.js # Live DB loader for credit_risk_model_conf_* + drift detection
+│   │   └── officeService.js           # Live office_info lookup & branch code verification
+│   ├── engine/
+│   │   ├── bandEvaluator.js           # Dynamic score band matcher from live DB bands
+│   │   └── nanoLoanEvaluator.js       # 5-stage Nano Loan eligibility & credit scoring engine
+│   ├── reporters/
+│   │   └── consoleReporter.js         # Structured terminal report, drift alerts & DB reconciler
+│   ├── utils/
+│   │   └── dateUtils.js               # Asia/Dhaka (UTC+6) date math & Bangladesh working-day helper
+│   └── index.js                       # Main CLI entrypoint (interactive prompt + CLI arg support)
+├── check_member.js                    # Backward-compatible root CLI wrapper -> src/index.js
+├── package.json                       # Dependencies & npm scripts
+├── NANO_LOAN_QA_KNOWLEDGE_BASE.md     # SRS business rules & DB schema reference
+└── README.md                          # Documentation & usage guide
 ```
 
 ---
 
-## 🔐 Credentials & Environment Reference
+## ⚙️ Configuration (`config/config.properties`)
 
-- **ERP UI**: `https://env102-erp.bracits.net`
-- **Eligibility Report**: `https://env102-erp.bracits.net/node/mfDashboard#!/microfinanceReport/nanoLoanEligibilityReport`
-- **Assessment Configuration**: `https://env102-erp.bracits.net/node/mfDashboard#!/creditEligibilityAssessmentConf/create`
-- **Branch Office [0459] Login**: User: `97816` / Pass: `2ieRG*yh`
-- **Head Office Login**: User: `mashuk` / Pass: `e8SP$YC@`
-- **Database Configuration** (`db.js`):
-  - Host: `10.150.150.52`
-  - Port: `4550`
-  - Database: `sbicloud_bd`
-  - User: `aditya_2344`
+Update `config/config.properties` whenever you switch environment, office, credentials, or create/modify a Nano Loan product:
+
+```properties
+# ERP Application & Environment
+base.url=https://env102-erp.bracits.net
+
+# Trailing IDs from: https://env102-erp.bracits.net/node/mfDashboard#!/loanProduct/show/id=<ID>
+# Both Dabi (Project ID: 1) and Progoti (Project ID: 2) are checked live from DB on every run
+# and verified against the input member's project.
+loan.product.dabi.id=235
+loan.product.progoti.id=234
+
+# Office & Branch Configuration
+office.id=578
+branch.office.code=0459
+branch.username=97816
+branch.password=2ieRG*yh
+
+# Head Office Credentials
+head.office.username=mashuk
+head.office.password=e8SP$YC@
+
+# Database Configuration
+db.host=10.150.150.52
+db.port=4550
+db.name=sbicloud_bd
+db.user=aditya_2344
+db.password=Th7T0fKG3$DYJ53E
+db.connection.timeout.ms=10000
+
+# Optional Overrides
+evaluation.business.date=
+eligibility.run.id=latest
+```
+
+> **Note**: You can also point to an alternate properties file at runtime via `CONFIG_PROPERTIES_PATH=/path/to/custom.properties`.
+
+---
+
+## 🛠️ Prerequisites & Installation
+
+1. **Node.js** `18.x` / `20.x` or higher.
+2. **VPN Access** to the internal database host (`10.150.150.52:4550`).
+3. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+---
+
+## 🚀 How to Run
+
+### Option 1: Interactive Prompt Mode (Default)
+Run the codebase and enter the Member ID when prompted:
+```bash
+npm start
+# or
+node check_member.js
+```
+**Terminal Prompt:**
+```text
+Please enter Member ID (e.g. 16273461, 16292015, 34145511): 16273461
+```
+
+### Option 2: Direct Command-Line Argument
+Pass the Member ID directly:
+```bash
+node check_member.js 16273461
+# or
+npm run check -- 16292015
+```
+
+#### Sample Test Members
+- `16273461` — Eligible Dabi Member (Project 1, verified against `loan.product.dabi.id=235`)
+- `16292015` — Eligible Progoti Member (Project 2, verified against `loan.product.progoti.id=234`)
+- `14703103` — Failed at Step 2 (Running loan repaid below threshold)
+- `14582259` — Failed at Step 4 (Computed ceiling below project minimum)
+- `34145511` — Real-time Core ERP Evaluation (Member outside previous batch run)
 
 ---
 
