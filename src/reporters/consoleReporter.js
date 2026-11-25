@@ -128,6 +128,10 @@ function generateReport(res) {
 
   const displayFinalScore =
     evaluation.systemFinalScore !== undefined ? evaluation.systemFinalScore : evaluation.finalScore;
+  const formattedFinalScore =
+    displayFinalScore !== null && displayFinalScore !== undefined
+      ? `${Number(displayFinalScore).toFixed(3)} (Threshold: ${s5.requiredScore})`
+      : `N/A (Threshold: ${s5.requiredScore})`;
 
   console.log(`
 👤 MEMBER INFORMATION:
@@ -140,7 +144,7 @@ function generateReport(res) {
   - Assessment Status: ${isEligible ? '✅ ELIGIBLE' : '❌ NOT ELIGIBLE'}${!isEligible ? `\n  - Failure Reason   : [Step ${evaluation.failedStep}] ${evaluation.failedReason}` : ''}
   - Min Loan Ceiling : ${formatCurrency(evaluation.minEligibleAmount)}
   - Max Loan Ceiling : ${formatCurrency(evaluation.maxEligibleAmount)}
-  - Final Score      : ${displayFinalScore.toFixed(3)} (Threshold: ${s5.requiredScore})
+  - Final Score      : ${formattedFinalScore}
   `);
 
   if (applicableProductInfo && applicableProductInfo.verificationMessage) {
@@ -243,21 +247,27 @@ function generateReport(res) {
     );
 
     const sysRow = systemRecord.eligibleRow || {};
+    const fmtScore = (v) => (v !== null && v !== undefined ? Number(v).toFixed(3) : 'N/A');
     console.log('  System Parameter Summary Scores:');
-    console.log(`  - Param 1 (Installment Payment Behavior) : ${Number(sysRow.param1_score || 0).toFixed(3)}`);
-    console.log(`  - Param 2 (Savings Paid with Installment): ${Number(sysRow.param2_score || 0).toFixed(3)}`);
-    console.log(`  - Param 3 (Savings Adjustment Prev Loan) : ${Number(sysRow.param3_score || 0).toFixed(3)}`);
-    console.log(`  - Param 4 (Savings Withdrawal in Window) : ${Number(sysRow.param4_score || 0).toFixed(3)}`);
+    console.log(`  - Param 1 (Installment Payment Behavior) : ${fmtScore(sysRow.param1_score)}`);
+    console.log(`  - Param 2 (Savings Paid with Installment): ${fmtScore(sysRow.param2_score)}`);
+    console.log(`  - Param 3 (Savings Adjustment Prev Loan) : ${fmtScore(sysRow.param3_score)}`);
+    console.log(`  - Param 4 (Savings Withdrawal in Window) : ${fmtScore(sysRow.param4_score)}`);
     console.log('\n  Final Credit Score Calculation:');
-    console.log('  Formula          : (Param1 + Param2 + Param3 + Param4) / 4');
-    console.log(
-      `                   : (${Number(sysRow.param1_score || 0).toFixed(3)} + ${Number(sysRow.param2_score || 0).toFixed(3)} + ${Number(sysRow.param3_score || 0).toFixed(3)} + ${Number(sysRow.param4_score || 0).toFixed(3)}) / 4`
-    );
-    console.log(`  Final Score      : ${Number(sysRow.final_score || 0).toFixed(3)}`);
-    console.log(`  Required Score   : >= ${s5.requiredScore}`);
-    console.log(`  Step Verdict     : ${Number(sysRow.final_score || 0) >= s5.requiredScore ? '✅ PASS' : '❌ FAIL'}`);
+    if (sysRow.final_score !== null && sysRow.final_score !== undefined) {
+      console.log('  Formula          : (Param1 + Param2 + Param3 + Param4) / 4');
+      console.log(
+        `                   : (${fmtScore(sysRow.param1_score)} + ${fmtScore(sysRow.param2_score)} + ${fmtScore(sysRow.param3_score)} + ${fmtScore(sysRow.param4_score)}) / 4`
+      );
+      console.log(`  Final Score      : ${fmtScore(sysRow.final_score)}`);
+      console.log(`  Required Score   : >= ${s5.requiredScore}`);
+      console.log(`  Step Verdict     : ${Number(sysRow.final_score) >= s5.requiredScore ? '✅ PASS' : '❌ FAIL'}`);
+    } else {
+      console.log(`  Final Score      : N/A (${s5.reason || sysRow.fail_reason || 'No scoring data'})`);
+      console.log(`  Step Verdict     : ❌ FAIL`);
+    }
   } else {
-    console.log(`  1. Installment Payment Behavior Score : ${s5.param1.score.toFixed(3)}`);
+    console.log(`  1. Installment Payment Behavior Score : ${s5.param1.score !== null ? s5.param1.score.toFixed(3) : 'N/A (No collections in window)'}`);
     s5.param1.details.forEach((d) => {
       console.log(`     - Loan ${d.loanId}: ${d.behaviorLabel} (Score: ${d.score})`);
     });
@@ -278,11 +288,15 @@ function generateReport(res) {
     );
 
     console.log('\n  Final Credit Score Calculation:');
-    console.log('  Formula          : (Param1 + Param2 + Param3 + Param4) / 4');
-    console.log(
-      `                   : (${s5.param1.score.toFixed(3)} + ${s5.param2.score.toFixed(3)} + ${s5.param3.score.toFixed(3)} + ${s5.param4.score.toFixed(3)}) / 4`
-    );
-    console.log(`  Final Score      : ${s5.finalScore.toFixed(3)}`);
+    if (s5.finalScore !== null) {
+      console.log('  Formula          : (Param1 + Param2 + Param3 + Param4) / 4');
+      console.log(
+        `                   : (${s5.param1.score.toFixed(3)} + ${s5.param2.score.toFixed(3)} + ${s5.param3.score.toFixed(3)} + ${s5.param4.score.toFixed(3)}) / 4`
+      );
+      console.log(`  Final Score      : ${s5.finalScore.toFixed(3)}`);
+    } else {
+      console.log(`  Final Score      : N/A`);
+    }
     console.log(`  Required Score   : >= ${s5.requiredScore}`);
     console.log(`  Step Verdict     : ${s5.passed ? '✅ PASS' : '❌ FAIL - ' + s5.reason}`);
   }

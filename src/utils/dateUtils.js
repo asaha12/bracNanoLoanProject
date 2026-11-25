@@ -74,16 +74,18 @@ function yearMonth(dateStr) {
 /**
  * Checks whether a YYYY-MM-DD date falls within the last N working days of its month.
  * Bangladesh standard workweek: Sunday (0) through Thursday (4) are working days;
- * Friday (5) and Saturday (6) are weekend days.
+ * Friday (5) and Saturday (6) are weekend days. Optional holidaySet excludes public holidays.
  */
-function isInLastWorkingDaysOfMonth(dateStr, count = 3) {
+function isInLastWorkingDaysOfMonth(dateStr, count = 3, holidaySet = null) {
   const [y, m, d] = dateStr.split('-').map(Number);
   const lastDayOfMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
 
   const workingDaysFromEnd = [];
   for (let day = lastDayOfMonth; day >= 1 && workingDaysFromEnd.length < count; day--) {
+    const dt = `${y}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
     const dow = new Date(Date.UTC(y, m - 1, day)).getUTCDay();
-    if (dow !== 5 && dow !== 6) {
+    const isHoliday = holidaySet ? holidaySet.has(dt) : false;
+    if (dow !== 5 && dow !== 6 && !isHoliday) {
       workingDaysFromEnd.push(day);
     }
   }
@@ -93,6 +95,22 @@ function isInLastWorkingDaysOfMonth(dateStr, count = 3) {
   return d >= earliestLastWorkingDay;
 }
 
+/**
+ * Expands [fromDateStr .. toDateStr] inclusive into YYYY-MM-DD strings.
+ */
+function expandDateRange(fromDateStr, toDateStr) {
+  if (!fromDateStr) return [];
+  const end = toDateStr && toDateStr >= fromDateStr ? toDateStr : fromDateStr;
+  const dates = [];
+  let cur = parseDateStr(fromDateStr);
+  const endDt = parseDateStr(end);
+  while (cur <= endDt && dates.length <= 366) {
+    dates.push(formatUtcDate(cur));
+    cur = new Date(cur.getTime() + 24 * 60 * 60 * 1000);
+  }
+  return dates;
+}
+
 module.exports = {
   toDhakaDateStr,
   parseDateStr,
@@ -100,5 +118,6 @@ module.exports = {
   addYears,
   diffDays,
   yearMonth,
-  isInLastWorkingDaysOfMonth
+  isInLastWorkingDaysOfMonth,
+  expandDateRange
 };

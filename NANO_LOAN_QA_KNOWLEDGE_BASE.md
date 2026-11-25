@@ -111,20 +111,21 @@ flowchart TD
 A comprehensive behavioral assessment evaluating 4 independent credit risk parameters across the evaluated loans:
 
 #### Parameter 1: Installment Payment Behavior (`INSTALLMENT_PAYMENT_BEHAVIOR`)
-- Evaluates timeliness of each installment collection:
+- Evaluates timeliness of each scheduled collection date (`loan_collection.is_collection_date = true`) inside the 12-month evaluation window (`Asia/Dhaka` dates):
   | Behavioral Condition | Score |
   | :--- | :--- |
-  | On scheduled date | 5.0 |
+  | On scheduled date (or ahead of schedule / early settlement `trx_type = 6`) | 5.0 |
   | Within the month | 4.0 |
-  | Within last 3 working days of the month | 3.0 |
-  | Exceeding the month | 2.0 |
-- **Aggregation Rule**: For each individual loan, assign the **lowest** score obtained across all installments.
+  | Within last 3 working days of the month (Sun–Thu workweek) | 3.0 |
+  | Exceeding the month (month-end `overdue_amount > 0` → also fails Step 3) | 2.0 |
+- **Aggregation Rule**: For each individual loan with due installments in the evaluation window, assign the **lowest** score obtained across all due installments.
 - Loan scores are then averaged across the evaluated loans:
   $$\text{Param 1 Score} = \frac{\sum \text{Loan Score}_i}{\text{Number of Loans}}$$
 
 #### Parameter 2: Savings Paid with Loan Installment (`SAVINGS_PAID_WITH_INSTALLMENT`)
-- Measures savings deposit habits into compulsory savings (`savings_account_type = 1`) concurrent with loan installments.
-- Evaluated as total savings deposits during loan term divided by total loan value / installments.
+- Measures savings deposit habits into compulsory savings (`savings_account.account_type_id = 1`) within `[COALESCE(first_installment_date, disbursement_date) .. LEAST(settlement_date, business_date)]`.
+- **Numerator**: Sum of compulsory savings deposits with `trx_type != 4` (excludes Interest Credited `trx_type = 4`, includes standard deposits `trx_type = 1`, smart collection `trx_type = 13`, and excess loan-to-savings transfers `trx_type = 40`).
+- **Denominator**: `COUNT(loan_collection WHERE is_collection_date = true up to business_date) × loan_account.installment_amount`.
 - **Scoring Bands (Dabi Member - Project 1)**:
   | Behavioral Condition | Score |
   | :--- | :--- |
@@ -151,7 +152,7 @@ A comprehensive behavioral assessment evaluating 4 independent credit risk param
 - Loan scores are averaged across evaluated loans to obtain `Param 3 Score`.
 
 #### Parameter 4: Savings Withdrawal Before Repayment Date (`SAVINGS_WITHDRAWAL_BEFORE_REPAYMENT`)
-- Considers withdrawals from compulsory savings across the last **11 installments** (`installments_to_consider = 11`) relative to repayment dates within **7 days** (`days_before_repayment = 7`):
+- Considers compulsory savings (`savings_account.account_type_id = 1`) withdrawals within the date span of the member's last **11 scheduled collection dates** (`loan_collection.is_collection_date = true` across evaluated loans, `installments_to_consider = 11`) relative to the next scheduled collection date within **7 days** (`days_before_repayment = 7`):
   | Behavioral Condition | Score |
   | :--- | :--- |
   | Never withdrew | 5.0 |

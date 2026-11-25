@@ -111,7 +111,7 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
     'SELECT * FROM credit_risk_model_conf_final_score WHERE domain_status_id = 1 ORDER BY id DESC LIMIT 1'
   );
   const paramConfRes = await client.query(
-    'SELECT * FROM credit_risk_model_conf_credit_score_parameter WHERE domain_status_id = 1 ORDER BY id DESC'
+    'SELECT * FROM credit_risk_model_conf_credit_score_parameter WHERE domain_status_id = 1 ORDER BY last_updated DESC NULLS LAST, id DESC'
   );
   const scoreBandRes = await client.query(
     `
@@ -200,6 +200,10 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
         }))
       : (snapshot && snapshot.score_bands) || [];
 
+  const latestWithdrawalParam = scoreParameters.find(
+    (p) => p.parameterCode === 'SAVINGS_WITHDRAWAL_BEFORE_REPAYMENT'
+  );
+
   const liveConfig = {
     source: 'LIVE_DATABASE_TABLES',
     loadedAt: new Date().toISOString(),
@@ -234,6 +238,14 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
     required_final_score: finalScoreRow
       ? Number(finalScoreRow.required_final_score)
       : (snapshot && snapshot.required_final_score) || DEFAULT_FALLBACK_CONFIG.required_final_score,
+    installments_to_consider:
+      (latestWithdrawalParam && latestWithdrawalParam.frequencyNoToConsider) ||
+      (snapshot && snapshot.installments_to_consider) ||
+      DEFAULT_FALLBACK_CONFIG.installments_to_consider,
+    days_before_repayment:
+      (latestWithdrawalParam && latestWithdrawalParam.daysBeforeRepayment) ||
+      (snapshot && snapshot.days_before_repayment) ||
+      DEFAULT_FALLBACK_CONFIG.days_before_repayment,
     general_loan_product_ids: generalLoanProductIds,
     project_ceilings: Array.from(ceilingMap.values()),
     score_parameters: scoreParameters,

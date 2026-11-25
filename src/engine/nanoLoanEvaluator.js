@@ -14,7 +14,8 @@ const {
   addMonths,
   addYears,
   diffDays,
-  isInLastWorkingDaysOfMonth
+  isInLastWorkingDaysOfMonth,
+  expandDateRange
 } = require('../utils/dateUtils');
 
 class NanoLoanEvaluator {
@@ -210,18 +211,21 @@ class NanoLoanEvaluator {
       SELECT la.id, la.account_no, la.loan_status_id, la.disbursed_amount,
              la.outstanding_balance, la.total_amount, la.product_info_id,
              la.project_info_id, la.office_info_id, la.disbursement_date, la.date_created,
-             la.first_installment_date, la.installment_amount, la.no_of_installment,
+             la.first_installment_date, la.settlement_date, la.installment_amount, la.no_of_installment,
              TO_CHAR(la.disbursement_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS disb_date_bd,
              TO_CHAR(la.first_installment_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS first_inst_date_bd,
+             TO_CHAR(la.settlement_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS settle_date_bd,
              lp.loan_name AS product_name
       FROM loan_account la
       JOIN loan_product lp ON lp.id = la.product_info_id
       WHERE la.member_id = $1
         AND la.office_info_id = $2
+        AND la.domain_status_id = 1
         AND (la.product_info_id = ANY($3::bigint[]) OR lp.loan_product_type_id = 1)
+        AND (la.disbursement_date AT TIME ZONE 'Asia/Dhaka')::date <= $4::date
       ORDER BY la.disbursement_date DESC, la.id DESC
       `,
-      [memberId, officeId, productIds]
+      [memberId, officeId, productIds, businessDateStr]
     );
 
     const allGeneralLoans = loansRes.rows;
@@ -238,6 +242,13 @@ class NanoLoanEvaluator {
     const minLoanCycle = this.config.minimum_loan_cycle || 2;
     const generalLoanCount = eligibleWindowLoans.length;
     const step1Pass = generalLoanCount >= minLoanCycle;
+    let step1Reason = null;
+    if (!step1Pass) {
+      step1Reason =
+        allGeneralLoans.length < minLoanCycle
+          ? `Only ${allGeneralLoans.length} general loan(s), minimum ${minLoanCycle} required`
+          : `Loan history exceeds the ${historyYears}-year window`;
+    }
     const step1Result = {
       step: 1,
       name: 'Minimum Loan Cycle',
@@ -246,9 +257,7 @@ class NanoLoanEvaluator {
       actualCount: generalLoanCount,
       historyCutoff: historyCutoffStr,
       passed: step1Pass,
-      reason: step1Pass
-        ? null
-        : `Only ${generalLoanCount} general loan(s), minimum ${minLoanCycle} required`
+      reason: step1Reason
     };
 
     // ----------------------------------------------------
@@ -295,7 +304,9 @@ class NanoLoanEvaluator {
     };
 
     // ----------------------------------------------------
-    // STEP 3: Due Month Repayment Criteria
+    // STEP 3 (Due Month Repayment) & STEP 5 Param 1 Prep
+    // Uses loan_collection scheduled due rows (is_collection_date = true)
+    // and monthly clearing entries in Asia/Dhaka up to businessDate.
     // ----------------------------------------------------
     const evalPeriodValue = Number(this.config.due_month_evaluation_period || 12);
     const evalPeriodUnit = String(this.config.due_month_evaluation_period_unit || 'MONTH').toUpperCase();
@@ -304,28 +315,190 @@ class NanoLoanEvaluator {
         ? addYears(businessDateStr, -evalPeriodValue)
         : addMonths(businessDateStr, -evalPeriodValue);
 
+    const numToAvg = this.config.number_of_loans_to_avg || 2;
+    const loansToAvg = eligibleWindowLoans.slice(0, numToAvg);
+
+    const bands = this.config.score_bands;
+    const params = this.config.score_parameters;
+    const p1Conf = getScoreParameterConfig(params, 'INSTALLMENT_PAYMENT_BEHAVIOR', projectId);
+    const p1Loans = eligibleWindowLoans.slice(0, (p1Conf && p1Conf.loanCount) || numToAvg);
+
     let step3Pass = true;
     let step3Reason = null;
+    let totalDueMonthsChecked = 0;
+    const param1Details = [];
 
-    const collectionsRes = await client.query(
+    // Load active holidays in the evaluation window for accurate Bangladesh last-3-working-days check
+    const holidaySet = new Set();
+    const holidayRes = await client.query(
       `
-      SELECT lat.id, lat.loan_account_id, lat.collection_amount, lat.transaction_date, lat.trx_type,
-             TO_CHAR(lat.transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS bd_date,
-             lc.collection_date, lc.is_collection_date
-      FROM loan_account_transaction lat
-      LEFT JOIN loan_collection lc
-        ON lc.office_info_id = lat.office_info_id
-       AND lc.loan_account_id = lat.loan_account_id
-       AND lc.id = lat.collection_id
-      WHERE lat.office_info_id = $1
-        AND lat.loan_account_id = ANY($2::bigint[])
-        AND (lat.transaction_date AT TIME ZONE 'Asia/Dhaka')::date > $3::date
-        AND (lat.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $4::date
-        AND lat.collection_amount > 0
-      ORDER BY lat.transaction_date
+      SELECT TO_CHAR(from_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS from_bd,
+             TO_CHAR(to_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS to_bd
+      FROM holiday
+      WHERE status_id = 1
+        AND (office_id IS NULL OR office_id = $1)
+        AND (to_date AT TIME ZONE 'Asia/Dhaka')::date >= $2::date
+        AND (from_date AT TIME ZONE 'Asia/Dhaka')::date <= $3::date
       `,
-      [officeId, eligibleWindowLoans.map((l) => l.id), evalPeriodCutoffStr, businessDateStr]
+      [officeId, evalPeriodCutoffStr, businessDateStr]
     );
+    for (const h of holidayRes.rows) {
+      for (const dt of expandDateRange(h.from_bd, h.to_bd)) {
+        holidaySet.add(dt);
+      }
+    }
+
+    for (const loan of p1Loans) {
+      const lcRes = await client.query(
+        `
+        SELECT lc.id, lc.collection_no,
+               TO_CHAR(lc.collection_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS bd_date,
+               TO_CHAR(lc.collection_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM') AS bd_ym,
+               lc.is_collection_date, lc.realizable_amount, lc.realized_amount, lc.overdue_amount,
+               lc.principal_overdue_amount, lc.no_of_overdue_instalment
+        FROM loan_collection lc
+        WHERE lc.office_info_id = $1
+          AND lc.loan_account_id = $2
+          AND lc.domain_status_id = 1
+          AND (lc.collection_date AT TIME ZONE 'Asia/Dhaka')::date <= $3::date
+        ORDER BY lc.collection_date ASC, lc.collection_no ASC, lc.id ASC
+        `,
+        [officeId, loan.id, businessDateStr]
+      );
+
+      const allLcRows = lcRes.rows;
+      const rows = allLcRows.filter(
+        (r) => r.bd_date > evalPeriodCutoffStr && r.bd_date <= businessDateStr
+      );
+      const dueRows = rows.filter((r) => r.is_collection_date === true);
+      if (dueRows.length === 0) {
+        continue;
+      }
+
+      // Check early full settlement (trx_type = 6) and cumulative installment payments
+      const latRes = await client.query(
+        `
+        SELECT trx_type, collection_amount,
+               TO_CHAR(transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS bd_date,
+               TO_CHAR(transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM') AS bd_ym
+        FROM loan_account_transaction
+        WHERE office_info_id = $1
+          AND loan_account_id = $2
+          AND domain_status_id = 1
+          AND collection_amount > 0
+          AND (transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $3::date
+        ORDER BY transaction_date ASC, id ASC
+        `,
+        [officeId, loan.id, businessDateStr]
+      );
+      const earlySettleMonths = new Set(
+        latRes.rows
+          .filter((r) => Number(r.trx_type) === 6 && r.bd_date > evalPeriodCutoffStr)
+          .map((r) => r.bd_ym)
+      );
+
+      // Track cumulative installment payments so borrowers who prepaid extra installments
+      // ahead of their monthly schedule (e.g. two full installments in a prior month) are recognized
+      const instAmt = Number(loan.installment_amount || 0);
+      const firstInstDate = loan.first_inst_date_bd || toDhakaDateStr(loan.first_installment_date);
+      let runningPaid = 0;
+      const monthAheadOfSchedule = new Set();
+      const hasSavingsAdjustment = latRes.rows.some((r) => Number(r.trx_type) === 7);
+      for (const tx of latRes.rows) {
+        const prevPaid = runningPaid;
+        runningPaid += Number(tx.collection_amount || 0);
+        if (instAmt > 0 && firstInstDate && !hasSavingsAdjustment && tx.bd_date > evalPeriodCutoffStr) {
+          const instIdx = Math.floor(prevPaid / instAmt) + 1;
+          const schedDate = addMonths(firstInstDate, instIdx - 1);
+          if (tx.bd_date <= schedDate && !isInLastWorkingDaysOfMonth(tx.bd_date, 3, holidaySet)) {
+            monthAheadOfSchedule.add(tx.bd_ym);
+          }
+        }
+      }
+
+      totalDueMonthsChecked += dueRows.length;
+      let worstSeq = 1; // 1 = On scheduled date, 2 = Within month, 3 = Last 3 working days, 4 = Exceeding month
+
+      for (const dueRow of dueRows) {
+        const monthRows = rows.filter((r) => r.bd_ym === dueRow.bd_ym);
+        const lastInMonth = monthRows[monthRows.length - 1];
+        const paysAfterDueInMonth = monthRows.filter(
+          (r) => r.collection_no > dueRow.collection_no && Number(r.realized_amount) > 0
+        );
+        const anyNextPayLaterMonth = allLcRows.find(
+          (r) =>
+            r.collection_no > dueRow.collection_no &&
+            r.bd_ym > dueRow.bd_ym &&
+            Number(r.realized_amount) > 0 &&
+            !allLcRows.some(
+              (d2) =>
+                d2.is_collection_date &&
+                d2.collection_no > dueRow.collection_no &&
+                d2.collection_no < r.collection_no
+            )
+        );
+
+        let instSeq = 1;
+        if (
+          Number(lastInMonth.overdue_amount) > 0 &&
+          (paysAfterDueInMonth.length > 0 ||
+            Boolean(anyNextPayLaterMonth) ||
+            Number(lastInMonth.principal_overdue_amount) > 0 ||
+            Number(lastInMonth.no_of_overdue_instalment) > 0)
+        ) {
+          instSeq = 4;
+          step3Pass = false;
+          step3Reason = 'Installment(s) not repaid within their due month';
+        } else if (
+          Number(dueRow.overdue_amount) === 0 ||
+          earlySettleMonths.has(dueRow.bd_ym) ||
+          monthAheadOfSchedule.has(dueRow.bd_ym) ||
+          paysAfterDueInMonth.some(
+            (r) => r.bd_date <= dueRow.bd_date && Number(r.overdue_amount) === 0
+          ) ||
+          paysAfterDueInMonth.length === 0
+        ) {
+          instSeq = 1;
+        } else {
+          const clearRow =
+            paysAfterDueInMonth.find((r) => Number(r.overdue_amount) === 0) ||
+            paysAfterDueInMonth[paysAfterDueInMonth.length - 1];
+
+          if (isInLastWorkingDaysOfMonth(clearRow.bd_date, 3, holidaySet)) {
+            instSeq = 3;
+          } else {
+            instSeq = 2;
+          }
+        }
+
+        worstSeq = Math.max(worstSeq, instSeq);
+      }
+
+      const fallbackP1 =
+        worstSeq === 1
+          ? { score: 5, label: 'On scheduled date' }
+          : worstSeq === 2
+          ? { score: 4, label: 'Within the month' }
+          : worstSeq === 3
+          ? { score: 3, label: 'Within last 3 working days of the month' }
+          : { score: 2, label: 'Exceeding the month' };
+
+      const matched = matchSeqBand(
+        bands,
+        'INSTALLMENT_PAYMENT_BEHAVIOR',
+        projectId,
+        worstSeq,
+        fallbackP1
+      );
+
+      param1Details.push({
+        loanId: loan.id,
+        disbursedAmount: Number(loan.disbursed_amount),
+        collectionsCount: dueRows.length,
+        behaviorLabel: matched.label,
+        score: matched.score
+      });
+    }
 
     const step3Result = {
       step: 3,
@@ -334,7 +507,7 @@ class NanoLoanEvaluator {
       evaluationPeriodUnit: evalPeriodUnit,
       evaluationRule: this.config.due_month_evaluation_rule || 'WITHIN_THE_MONTH',
       evaluationPeriodCutoff: evalPeriodCutoffStr,
-      totalCollectionsChecked: collectionsRes.rows.length,
+      totalCollectionsChecked: totalDueMonthsChecked,
       passed: step3Pass,
       reason: step3Pass ? null : step3Reason
     };
@@ -342,8 +515,6 @@ class NanoLoanEvaluator {
     // ----------------------------------------------------
     // STEP 4: Eligible Loan Amount Calculation (Live Loan Product Ceilings)
     // ----------------------------------------------------
-    const numToAvg = this.config.number_of_loans_to_avg || 2;
-    const loansToAvg = eligibleWindowLoans.slice(0, numToAvg);
     let avgDisbursedAmount = 0;
     let computedCeiling = 0;
     let step4Pass = true;
@@ -421,138 +592,40 @@ class NanoLoanEvaluator {
     // ----------------------------------------------------
     // STEP 5: Credit Scoring Parameters (Live Bands & Parameters)
     // ----------------------------------------------------
-    const bands = this.config.score_bands;
-    const params = this.config.score_parameters;
-
-    // Param 1: Installment Payment Behavior
-    // Evaluates installments inside the evaluation window (Asia/Dhaka dates),
-    // checking on-schedule / early settlement (5), within month (4), and Bangladesh
-    // last 3 working days (3). Loans with 0 collections in the evaluation window are skipped.
-    const p1Conf = getScoreParameterConfig(params, 'INSTALLMENT_PAYMENT_BEHAVIOR', projectId);
-    const p1Loans = eligibleWindowLoans.slice(0, (p1Conf && p1Conf.loanCount) || numToAvg);
-    const param1Details = [];
-
-    for (const loan of p1Loans) {
-      const txRes = await client.query(
-        `
-        SELECT lat.id, lat.collection_amount, lat.transaction_date, lat.trx_type,
-               TO_CHAR(lat.transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS bd_date,
-               lc.collection_date, lc.is_collection_date
-        FROM loan_account_transaction lat
-        LEFT JOIN loan_collection lc
-          ON lc.office_info_id = lat.office_info_id
-         AND lc.loan_account_id = lat.loan_account_id
-         AND lc.id = lat.collection_id
-        WHERE lat.office_info_id = $1
-          AND lat.loan_account_id = $2
-          AND lat.collection_amount > 0
-          AND (lat.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $3::date
-        ORDER BY lat.transaction_date ASC, lat.id ASC
-        `,
-        [officeId, loan.id, businessDateStr]
-      );
-
-      const allTx = txRes.rows;
-      const inWindowTx = allTx.filter(
-        (t) => t.bd_date > evalPeriodCutoffStr && t.bd_date <= businessDateStr
-      );
-
-      // Only score loans that actually had installment activity within the evaluation period
-      if (inWindowTx.length === 0) {
-        continue;
-      }
-
-      const instAmt = Number(loan.installment_amount || 0);
-      const firstInstDate = loan.first_inst_date_bd || toDhakaDateStr(loan.first_installment_date);
-      let cumulativePaid = 0;
-      let worstSeq = 1; // 1 = On scheduled date, 2 = Within month, 3 = Last 3 working days
-
-      for (const t of allTx) {
-        const prevPaid = cumulativePaid;
-        cumulativePaid += Number(t.collection_amount || 0);
-
-        if (!(t.bd_date > evalPeriodCutoffStr && t.bd_date <= businessDateStr)) {
-          continue;
-        }
-
-        // Determine installment index covered by this payment (1-based)
-        const instIndex = instAmt > 0 ? Math.floor(prevPaid / instAmt) + 1 : null;
-        const scheduledDueDate =
-          firstInstDate && instIndex ? addMonths(firstInstDate, instIndex - 1) : null;
-
-        let txSeq = 2; // Default: Within the month
-        if (
-          t.is_collection_date === true ||
-          Number(t.trx_type) === 6 ||
-          (scheduledDueDate && t.bd_date <= scheduledDueDate)
-        ) {
-          txSeq = 1; // On scheduled date / ahead of schedule / early settlement
-        } else if (isInLastWorkingDaysOfMonth(t.bd_date, 3)) {
-          txSeq = 3; // Within last 3 working days of the month (Sun-Thu workweek)
-        } else {
-          txSeq = 2; // Within the month
-        }
-
-        worstSeq = Math.max(worstSeq, txSeq);
-      }
-
-      const fallbackP1 =
-        worstSeq === 1
-          ? { score: 5, label: 'On scheduled date' }
-          : worstSeq === 2
-          ? { score: 4, label: 'Within the month' }
-          : { score: 3, label: 'Within last 3 working days of the month' };
-
-      const matched = matchSeqBand(
-        bands,
-        'INSTALLMENT_PAYMENT_BEHAVIOR',
-        projectId,
-        worstSeq,
-        fallbackP1
-      );
-
-      param1Details.push({
-        loanId: loan.id,
-        disbursedAmount: Number(loan.disbursed_amount),
-        collectionsCount: inWindowTx.length,
-        behaviorLabel: matched.label,
-        score: matched.score
-      });
-    }
-
-    const param1Score =
-      param1Details.length > 0
-        ? param1Details.reduce((s, p) => s + p.score, 0) / param1Details.length
-        : 5;
+    const hasParam1Data = param1Details.length > 0;
+    const param1Score = hasParam1Data
+      ? param1Details.reduce((s, p) => s + p.score, 0) / param1Details.length
+      : null;
 
     // Param 2: Savings Paid with Loan Installment
-    // Filters strictly to Compulsory Savings (sa.account_type_id = 1, s.trx_type = 1)
-    // deposited in months with loan installment collections up to businessDate,
-    // without cartesian duplication across multiple collections in the same month.
+    // Numerator  : Compulsory Savings (sa.account_type_id = 1) member deposits (s.trx_type != 4)
+    //              within [COALESCE(first_installment_date, disbursement_date) .. LEAST(settlement_date, businessDate)].
+    // Denominator: Scheduled collection count (lc.is_collection_date = true up to businessDate) * loan.installment_amount.
     const p2Conf = getScoreParameterConfig(params, 'SAVINGS_PAID_WITH_INSTALLMENT', projectId);
     const p2Loans = eligibleWindowLoans.slice(0, (p2Conf && p2Conf.loanCount) || numToAvg);
     const param2Details = [];
 
     for (const loan of p2Loans) {
+      const loanStartDate =
+        loan.first_inst_date_bd ||
+        toDhakaDateStr(loan.first_installment_date) ||
+        loan.disb_date_bd ||
+        toDhakaDateStr(loan.disbursement_date);
+      const rawSettleDate = loan.settle_date_bd || toDhakaDateStr(loan.settlement_date);
+      const loanEndDate =
+        rawSettleDate && rawSettleDate <= businessDateStr ? rawSettleDate : businessDateStr;
+      const instAmt = Number(loan.installment_amount || 0);
+
       const res = await client.query(
         `
-        WITH loan_months AS (
-          SELECT DISTINCT TO_CHAR(lat.transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM') AS ym
-          FROM loan_account_transaction lat
-          WHERE lat.office_info_id = $2
-            AND lat.loan_account_id = $3
-            AND lat.collection_amount > 0
-            AND lat.trx_type != 7
-            AND (lat.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $4::date
-        ),
-        loan_totals AS (
-          SELECT COALESCE(SUM(lat.collection_amount), 0) AS total_installment
-          FROM loan_account_transaction lat
-          WHERE lat.office_info_id = $2
-            AND lat.loan_account_id = $3
-            AND lat.collection_amount > 0
-            AND lat.trx_type != 7
-            AND (lat.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $4::date
+        WITH sched_stats AS (
+          SELECT COUNT(*) AS sched_count
+          FROM loan_collection lc
+          WHERE lc.office_info_id = $2
+            AND lc.loan_account_id = $3
+            AND lc.is_collection_date = true
+            AND lc.domain_status_id = 1
+            AND (lc.collection_date AT TIME ZONE 'Asia/Dhaka')::date <= $4::date
         ),
         compulsory_savings AS (
           SELECT COALESCE(SUM(s.deposit_amount), 0) AS total_savings
@@ -563,19 +636,22 @@ class NanoLoanEvaluator {
           WHERE s.office_info_id = $2
             AND s.member_info_id = $1
             AND sa.account_type_id = 1
+            AND s.domain_status_id = 1
             AND s.deposit_amount > 0
-            AND s.trx_type = 1
-            AND (s.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $4::date
-            AND TO_CHAR(s.transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM') IN (SELECT ym FROM loan_months)
+            AND s.trx_type != 4
+            AND (s.transaction_date AT TIME ZONE 'Asia/Dhaka')::date >= $5::date
+            AND (s.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $6::date
         )
-        SELECT cs.total_savings, lt.total_installment
-        FROM compulsory_savings cs, loan_totals lt
+        SELECT cs.total_savings, ss.sched_count
+        FROM compulsory_savings cs, sched_stats ss
         `,
-        [memberId, officeId, loan.id, businessDateStr]
+        [memberId, officeId, loan.id, businessDateStr, loanStartDate, loanEndDate]
       );
 
       const totalSavings = Number(res.rows[0]?.total_savings || 0);
-      const totalInstallment = Number(res.rows[0]?.total_installment || Number(loan.disbursed_amount));
+      const schedCount = Number(res.rows[0]?.sched_count || 0);
+      const totalInstallment =
+        instAmt > 0 && schedCount > 0 ? schedCount * instAmt : Number(loan.disbursed_amount);
       const pct = totalInstallment > 0 ? (totalSavings / totalInstallment) * 100 : 0;
 
       const fallbackP2 =
@@ -671,70 +747,70 @@ class NanoLoanEvaluator {
         : 5;
 
     // Param 4: Savings Withdrawal Before Repayment
-    // Checks Compulsory Savings (sa.account_type_id = 1) withdrawals on or before
-    // the member's last N general-loan repayment dates (up to businessDate),
-    // comparing calendar-day distance against configured daysBeforeRepayment.
-    const p4Conf = getScoreParameterConfig(params, 'SAVINGS_WITHDRAWAL_BEFORE_REPAYMENT', projectId);
-    const daysBeforeRepayment = (p4Conf && p4Conf.daysBeforeRepayment) || 7;
-    const installmentsToConsider = (p4Conf && p4Conf.frequencyNoToConsider) || 11;
+    // Compares Compulsory Savings (sa.account_type_id = 1) withdrawals within the window
+    // spanned by the member's last N scheduled collection dates (lc.is_collection_date = true
+    // up to businessDate across evaluated general loans) against daysBeforeRepayment.
+    const daysBeforeRepayment = Number(this.config.days_before_repayment || 7);
+    const installmentsToConsider = Number(this.config.installments_to_consider || 11);
 
-    const repayDatesRes = await client.query(
+    const schedDatesRes = await client.query(
       `
-      SELECT DISTINCT TO_CHAR(lat.transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS bd_date
-      FROM loan_account_transaction lat
-      WHERE lat.office_info_id = $1
-        AND lat.loan_account_id = ANY($2::bigint[])
-        AND lat.collection_amount > 0
-        AND (lat.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $3::date
-      ORDER BY bd_date DESC
+      SELECT TO_CHAR(lc.collection_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS bd_date
+      FROM loan_collection lc
+      WHERE lc.office_info_id = $1
+        AND lc.loan_account_id = ANY($2::bigint[])
+        AND lc.is_collection_date = true
+        AND lc.domain_status_id = 1
+        AND (lc.collection_date AT TIME ZONE 'Asia/Dhaka')::date <= $3::date
+      ORDER BY lc.collection_date DESC, lc.id DESC
       LIMIT $4
       `,
-      [officeId, eligibleWindowLoans.map((l) => l.id), businessDateStr, installmentsToConsider]
+      [officeId, loansToAvg.map((l) => l.id), businessDateStr, installmentsToConsider]
     );
 
-    const consideredRepayDates = repayDatesRes.rows.map((r) => r.bd_date);
-    const earliestConsideredRepay =
-      consideredRepayDates.length > 0
-        ? consideredRepayDates[consideredRepayDates.length - 1]
-        : evalPeriodCutoffStr;
-    const p4WindowStart =
-      earliestConsideredRepay < evalPeriodCutoffStr ? earliestConsideredRepay : evalPeriodCutoffStr;
-
-    const withdrRes = await client.query(
-      `
-      SELECT TO_CHAR(s.transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS bd_date,
-             s.withdrawal_amount, s.trx_type
-      FROM savings_account_transaction s
-      JOIN savings_account sa
-        ON sa.id = s.savings_account_id
-       AND sa.office_info_id = s.office_info_id
-      WHERE s.office_info_id = $1
-        AND s.member_info_id = $2
-        AND sa.account_type_id = 1
-        AND s.withdrawal_amount > 0
-        AND (s.transaction_date AT TIME ZONE 'Asia/Dhaka')::date >= $3::date
-        AND (s.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $4::date
-      ORDER BY bd_date DESC
-      `,
-      [officeId, memberId, p4WindowStart, businessDateStr]
-    );
-
+    const consideredRepayDates = schedDatesRes.rows.map((r) => r.bd_date);
     let withdrawalsBeforeRepayCount = 0;
     let minDaysBeforeRepayment = null;
-    for (const w of withdrRes.rows) {
-      let closestGapForWithdrawal = null;
-      for (const rDate of consideredRepayDates) {
-        if (w.bd_date <= rDate) {
-          const gap = diffDays(w.bd_date, rDate);
-          if (closestGapForWithdrawal === null || gap < closestGapForWithdrawal) {
-            closestGapForWithdrawal = gap;
+
+    if (consideredRepayDates.length > 0) {
+      const p4WindowStart = consideredRepayDates[consideredRepayDates.length - 1];
+      const p4WindowEnd = consideredRepayDates[0];
+
+      const withdrRes = await client.query(
+        `
+        SELECT TO_CHAR(s.transaction_date AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS bd_date,
+               s.withdrawal_amount, s.trx_type
+        FROM savings_account_transaction s
+        JOIN savings_account sa
+          ON sa.id = s.savings_account_id
+         AND sa.office_info_id = s.office_info_id
+        WHERE s.office_info_id = $1
+          AND s.member_info_id = $2
+          AND sa.account_type_id = 1
+          AND s.domain_status_id = 1
+          AND s.withdrawal_amount > 0
+          AND (s.transaction_date AT TIME ZONE 'Asia/Dhaka')::date >= $3::date
+          AND (s.transaction_date AT TIME ZONE 'Asia/Dhaka')::date <= $4::date
+        ORDER BY bd_date DESC
+        `,
+        [officeId, memberId, p4WindowStart, p4WindowEnd]
+      );
+
+      for (const w of withdrRes.rows) {
+        let closestGapForWithdrawal = null;
+        for (const rDate of consideredRepayDates) {
+          if (w.bd_date <= rDate) {
+            const gap = diffDays(w.bd_date, rDate);
+            if (closestGapForWithdrawal === null || gap < closestGapForWithdrawal) {
+              closestGapForWithdrawal = gap;
+            }
           }
         }
-      }
-      if (closestGapForWithdrawal !== null) {
-        withdrawalsBeforeRepayCount += 1;
-        if (minDaysBeforeRepayment === null || closestGapForWithdrawal < minDaysBeforeRepayment) {
-          minDaysBeforeRepayment = closestGapForWithdrawal;
+        if (closestGapForWithdrawal !== null) {
+          withdrawalsBeforeRepayCount += 1;
+          if (minDaysBeforeRepayment === null || closestGapForWithdrawal < minDaysBeforeRepayment) {
+            minDaysBeforeRepayment = closestGapForWithdrawal;
+          }
         }
       }
     }
@@ -768,19 +844,31 @@ class NanoLoanEvaluator {
     const withdrCount = withdrawalsBeforeRepayCount;
 
     // Final Score
-    const finalScore = (param1Score + param2Score + param3Score + param4Score) / 4;
+    // If Param 1 has no scoring data in the evaluation window, the ERP system marks
+    // Step 5 as NOT_ELIGIBLE with "Score could not be computed (no scoring data)".
     const reqFinalScore = Number(this.config.required_final_score || 3.0);
-    const step5Pass = finalScore >= reqFinalScore;
-    const step5Reason = step5Pass
-      ? null
-      : `Final score ${finalScore.toFixed(3)} below required threshold ${reqFinalScore}`;
+    let finalScore = null;
+    let step5Pass = false;
+    let step5Reason = null;
+
+    if (!hasParam1Data) {
+      finalScore = null;
+      step5Pass = false;
+      step5Reason = 'Score could not be computed (no scoring data)';
+    } else {
+      finalScore = (param1Score + param2Score + param3Score + param4Score) / 4;
+      step5Pass = finalScore >= reqFinalScore;
+      step5Reason = step5Pass
+        ? null
+        : `Final score ${finalScore.toFixed(3)} below required threshold ${reqFinalScore}`;
+    }
 
     const step5Result = {
       step: 5,
       name: 'Credit Scoring & Final Score',
       param1: {
         code: 'INSTALLMENT_PAYMENT_BEHAVIOR',
-        score: Number(param1Score.toFixed(3)),
+        score: param1Score !== null ? Number(param1Score.toFixed(3)) : null,
         details: param1Details
       },
       param2: {
@@ -801,7 +889,7 @@ class NanoLoanEvaluator {
         installmentsToConsider,
         daysBeforeRepayment
       },
-      finalScore: Number(finalScore.toFixed(3)),
+      finalScore: finalScore !== null ? Number(finalScore.toFixed(3)) : null,
       requiredScore: reqFinalScore,
       passed: step5Pass,
       reason: step5Reason
@@ -889,7 +977,7 @@ class NanoLoanEvaluator {
       failedReason,
       minEligibleAmount: overallPassed ? step4Result.minEligibleAmount : projectCap.min_amount,
       maxEligibleAmount: overallPassed ? step4Result.maxEligibleAmount : step4Result.computedCeiling,
-      finalScore: Number(finalScore.toFixed(3))
+      finalScore: finalScore !== null ? Number(finalScore.toFixed(3)) : null
     };
 
     if (systemRecord.foundInEligibleTable && systemRecord.eligibleRow.final_score !== null) {
