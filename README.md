@@ -10,6 +10,9 @@ This tool evaluates any BRAC member's loan and savings history against the 5-sta
 
 - **Externalized Configuration (`config/config.properties`)**:
   - Centralized properties file for `base.url`, `loan.product.dabi.id` (`235`), `loan.product.progoti.id` (`234`), `office.id`, `branch.office.code`, branch credentials (`branch.username` / `branch.password`), head office credentials (`head.office.username` / `head.office.password`), and PostgreSQL DB settings.
+- **Live ERP Credential & Office Validation (Every Run)**:
+  - Authenticates **both** Branch (`branch.username` / `branch.password`) and Head Office (`head.office.username` / `head.office.password`) credentials live against BRAC ERP's **Keycloak OIDC Identity Provider** (`<base.url>/idp/realms/brac/...`) and `application_user` table on every run — immediately aborting execution if credentials are invalid, locked, or expired.
+  - Validates `office.id` against `branch.office.code` in `physical_office_info` (e.g. `office.id=342` → `[0459] Monirampur`), aborting with the exact matching `office.id` hint if misconfigured.
 - **Live Loan Product & Assessment Rule Verification (Every Run)**:
   - Queries `loan_product`, `project_loan_product_mapping`, `loan_product_interest_rate`, `loan_product_policy`, and `loan_product_details` live on every execution for **both Dabi and Progoti** loan products, verifying that each product is active and mapped to its project, and matching the evaluated member's project to the corresponding product.
   - Queries all active (`domain_status_id = 1`) `credit_risk_model_conf_*` tables live on every execution and flags any **Configuration Drift** versus the latest eligibility batch run snapshot.
@@ -37,9 +40,10 @@ bracNanoLoanProject/
 │   ├── db/
 │   │   └── connection.js              # PostgreSQL Client/Pool factory driven by config.properties
 │   ├── services/
-│   │   ├── loanProductService.js      # Live DB loader for configured loan.product.id (rates, policies, tenures, project map)
+│   │   ├── credentialService.js       # Live Keycloak OIDC + application_user auth for Branch & HO logins
+│   │   ├── loanProductService.js      # Live DB loader for configured Dabi & Progoti loan products
 │   │   ├── assessmentConfigService.js # Live DB loader for credit_risk_model_conf_* + drift detection
-│   │   └── officeService.js           # Live office_info lookup & branch code verification
+│   │   └── officeService.js           # Live physical_office_info lookup & branch.office.code verification
 │   ├── engine/
 │   │   ├── bandEvaluator.js           # Dynamic score band matcher from live DB bands
 │   │   └── nanoLoanEvaluator.js       # 5-stage Nano Loan eligibility & credit scoring engine
@@ -70,15 +74,15 @@ base.url=https://env102-erp.bracits.net
 loan.product.dabi.id=235
 loan.product.progoti.id=234
 
-# Office & Branch Configuration
-office.id=578
+# Office & Branch Configuration (physical_office_info.id, e.g. 342 for [0459] Monirampur)
+office.id=342
 branch.office.code=0459
 branch.username=97816
-branch.password=2ieRG*yh
+branch.password=a&RKdT4u
 
 # Head Office Credentials
 head.office.username=mashuk
-head.office.password=e8SP$YC@
+head.office.password=Xe^9uv%P
 
 # Database Configuration
 db.host=10.150.150.52

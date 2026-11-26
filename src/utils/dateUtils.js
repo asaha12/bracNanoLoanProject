@@ -72,6 +72,15 @@ function yearMonth(dateStr) {
 }
 
 /**
+ * Returns the last calendar day (YYYY-MM-DD) of the month containing dateStr.
+ */
+function lastDayOfMonth(dateStr) {
+  const [y, m] = dateStr.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${y}-${String(m).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+}
+
+/**
  * Checks whether a YYYY-MM-DD date falls within the last N working days of its month.
  * Bangladesh standard workweek: Sunday (0) through Thursday (4) are working days;
  * Friday (5) and Saturday (6) are weekend days. Optional holidaySet excludes public holidays.
@@ -118,6 +127,7 @@ module.exports = {
   addYears,
   diffDays,
   yearMonth,
+  lastDayOfMonth,
   isInLastWorkingDaysOfMonth,
   expandDateRange
 };

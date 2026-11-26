@@ -8,8 +8,8 @@ base.url=https://env102-erp.bracits.net
 loan.product.dabi.id=235
 loan.product.progoti.id=234
 
-# Office & Branch Configuration
-office.id=578
+# Office & Branch Configuration (physical_office_info.id, e.g. 342 for [0459] Monirampur)
+office.id=342
 branch.office.code=0459
 branch.username=YOUR_BRANCH_USERNAME
 branch.password=YOUR_BRANCH_PASSWORD

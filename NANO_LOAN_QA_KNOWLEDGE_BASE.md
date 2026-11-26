@@ -9,12 +9,12 @@
 | **Eligibility Assessment Conf** | `https://env102-erp.bracits.net/node/mfDashboard#!/creditEligibilityAssessmentConf/create` | Central configuration screen |
 | **Dabi Loan Product** | `https://env102-erp.bracits.net/node/mfDashboard#!/loanProduct/show/id=235` | Product ID: 235 |
 | **Progoti Loan Product** | `https://env102-erp.bracits.net/node/mfDashboard#!/loanProduct/show/id=234` | Product ID: 234 |
-| **Branch Office [0459] Login** | User: `97816` / Pass: `2ieRG*yh` | BAO / Branch User |
-| **Head Office Login** | User: `mashuk` / Pass: `e8SP$YC@` | Program Admin / SA |
+| **Branch Office [0459] Login** | User: `97816` / Pass: `a&RKdT4u` | BAO / Branch User (Validated live via Keycloak OIDC) |
+| **Head Office Login** | User: `mashuk` / Pass: `Xe^9uv%P` | Program Admin / SA (Validated live via Keycloak OIDC) |
 | **Database Host** | `10.150.150.52:4550` | EnterpriseDB PostgreSQL 15.7 |
 | **Database Name** | `sbicloud_bd` | Main Core Banking DB |
 | **Database User** | `aditya_2344` | QA / Read-only DB User |
-| **Branch Office [0459] ID** | `578` (`BD400459` - Joypurhat) | Configured as `office.id` in `config/config.properties` |
+| **Branch Office [0459] ID** | `342` (`[0459] Monirampur` in `physical_office_info`) | Configured as `office.id=342` in `config/config.properties` |
 
 > [!TIP]
 > **Externalized Properties & Live Config Verification**: All environment URLs, `office.id`, `loan.product.dabi.id`, `loan.product.progoti.id`, branch/HO credentials, and DB connection parameters are centralized in `config/config.properties`. On every execution, the QA engine dynamically queries `loan_product`, `project_loan_product_mapping`, `loan_product_interest_rate`, `loan_product_policy`, `loan_product_details`, and all active `credit_risk_model_conf_*` tables for both Dabi and Progoti products and verifies the evaluated member's project against the matching configured loan product.

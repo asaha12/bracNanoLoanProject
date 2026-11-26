@@ -1,24 +1,35 @@
 /**
  * Live Credit Risk Model Assessment Configuration Service
  * Reads active (domain_status_id = 1) configuration tables fresh on every run,
- * resolves the latest eligibility batch run for reconciliation, and detects
- * configuration drift between live DB rules / loan product settings and the last batch snapshot.
+ * including criteria toggles, effective dates, per-parameter loan_acc_status,
+ * and savings_account_type mappings, plus detects drift vs the latest batch run snapshot.
  */
 
 const DEFAULT_FALLBACK_CONFIG = {
   business_date: '2026-10-31',
   history_years: 4,
+  frequency_id: 3,
+  loan_status_ids: [1, 2, 3, 4],
   minimum_loan_cycle: 2,
   loans_to_select: 2,
   number_of_loans_to_avg: 2,
+  loan_amount_calc_loan_acc_status: 'ALL',
   eligible_loan_percentage: 20,
   required_paid_percentage: 30,
   required_final_score: 3.0,
   due_month_evaluation_period: 12,
   due_month_evaluation_period_unit: 'MONTH',
   due_month_evaluation_rule: 'WITHIN_THE_MONTH',
+  due_month_gate_enabled: true,
   installments_to_consider: 11,
   days_before_repayment: 7,
+  toggles: {
+    MIN_LOAN_CYCLE: true,
+    RUNNING_REPAYMENT: true,
+    DUE_MONTH_REPAYMENT: true,
+    LOAN_AMOUNT_CALC: true,
+    FINAL_SCORE: true
+  },
   general_loan_product_ids: [
     42, 46, 76, 79, 80, 96, 97, 100, 102, 103, 119, 126, 133, 134, 143, 145, 146,
     180, 181, 183, 184, 185, 188, 224, 225, 226, 227, 228, 230
@@ -28,6 +39,15 @@ const DEFAULT_FALLBACK_CONFIG = {
     { project_info_id: 2, project: 'Progoti', min_amount: 20000, max_amount: 100000 }
   ]
 };
+
+function normalizeLoanAccStatus(val) {
+  if (!val) return 'ALL';
+  const up = String(val).trim().toUpperCase();
+  if (up === 'BOTH' || up === 'ALL') return 'ALL';
+  if (up === 'ACTIVE') return 'ACTIVE';
+  if (up === 'CLOSED') return 'CLOSED';
+  return 'ALL';
+}
 
 async function loadLatestBatchRun(client, requestedRunId) {
   if (requestedRunId && requestedRunId !== 'latest') {
@@ -68,6 +88,14 @@ function buildConfigDriftReport(liveConfig, snapshot, configuredProducts) {
   compare('eligible_loan_percentage', liveConfig.eligible_loan_percentage, snapshot.eligible_loan_percentage);
   compare('required_final_score', liveConfig.required_final_score, snapshot.required_final_score);
 
+  if (snapshot._toggles && liveConfig.toggles) {
+    for (const k of Object.keys(liveConfig.toggles)) {
+      if (snapshot._toggles[k] !== undefined) {
+        compare(`toggle.${k}`, liveConfig.toggles[k], snapshot._toggles[k]);
+      }
+    }
+  }
+
   // Compare live Loan Product ceilings vs snapshot project_ceilings
   const snapCeilings = snapshot.project_ceilings || [];
   for (const prod of configuredProducts || []) {
@@ -95,37 +123,118 @@ function buildConfigDriftReport(liveConfig, snapshot, configuredProducts) {
  * plus the latest eligibility batch run for business date & drift comparison.
  */
 async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = []) {
+  const latestRun = await loadLatestBatchRun(client, appConfig.evaluation.runId);
+  const snapshot = latestRun && latestRun.config_snapshot ? latestRun.config_snapshot : null;
+
+  const businessDate =
+    appConfig.evaluation.businessDate ||
+    (snapshot && snapshot._business_date) ||
+    DEFAULT_FALLBACK_CONFIG.business_date;
+
+  const toggleRes = await client.query(
+    `
+    SELECT criteria_code, is_enabled
+    FROM (
+      SELECT criteria_code, is_enabled,
+             ROW_NUMBER() OVER (PARTITION BY criteria_code ORDER BY effective_date DESC, id DESC) AS rn
+      FROM credit_risk_model_conf_criteria_toggle
+      WHERE domain_status_id = 1
+        AND (effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+        AND (end_date IS NULL OR (end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
+    ) t
+    WHERE t.rn = 1
+    `,
+    [businessDate]
+  );
+
+  const toggles = { ...DEFAULT_FALLBACK_CONFIG.toggles };
+  for (const r of toggleRes.rows) {
+    toggles[r.criteria_code] = Boolean(r.is_enabled);
+  }
+
   const minCycleRes = await client.query(
-    'SELECT * FROM credit_risk_model_conf_min_loan_cycle WHERE domain_status_id = 1 ORDER BY id DESC LIMIT 1'
+    `
+    SELECT * FROM credit_risk_model_conf_min_loan_cycle
+    WHERE domain_status_id = 1
+      AND (effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+      AND (end_date IS NULL OR (end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
+    ORDER BY effective_date DESC, id DESC LIMIT 1
+    `,
+    [businessDate]
   );
   const runningRepayRes = await client.query(
-    'SELECT * FROM credit_risk_model_conf_running_repayment WHERE domain_status_id = 1 ORDER BY id DESC LIMIT 1'
+    `
+    SELECT * FROM credit_risk_model_conf_running_repayment
+    WHERE domain_status_id = 1
+      AND (effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+      AND (end_date IS NULL OR (end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
+    ORDER BY effective_date DESC, id DESC LIMIT 1
+    `,
+    [businessDate]
   );
   const dueMonthRes = await client.query(
-    'SELECT * FROM credit_risk_model_conf_due_month_repayment WHERE domain_status_id = 1 ORDER BY id DESC LIMIT 1'
+    `
+    SELECT * FROM credit_risk_model_conf_due_month_repayment
+    WHERE domain_status_id = 1
+      AND (effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+      AND (end_date IS NULL OR (end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
+    ORDER BY effective_date DESC, id DESC LIMIT 1
+    `,
+    [businessDate]
   );
   const loanAmtRes = await client.query(
-    'SELECT * FROM credit_risk_model_conf_loan_amount_calc WHERE domain_status_id = 1 ORDER BY id DESC LIMIT 1'
+    `
+    SELECT * FROM credit_risk_model_conf_loan_amount_calc
+    WHERE domain_status_id = 1
+      AND (effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+      AND (end_date IS NULL OR (end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
+    ORDER BY effective_date DESC, id DESC LIMIT 1
+    `,
+    [businessDate]
   );
   const finalScoreRes = await client.query(
-    'SELECT * FROM credit_risk_model_conf_final_score WHERE domain_status_id = 1 ORDER BY id DESC LIMIT 1'
+    `
+    SELECT * FROM credit_risk_model_conf_final_score
+    WHERE domain_status_id = 1
+      AND (effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+      AND (end_date IS NULL OR (end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
+    ORDER BY effective_date DESC, id DESC LIMIT 1
+    `,
+    [businessDate]
   );
   const paramConfRes = await client.query(
-    'SELECT * FROM credit_risk_model_conf_credit_score_parameter WHERE domain_status_id = 1 ORDER BY last_updated DESC NULLS LAST, id DESC'
+    `
+    SELECT c.*, s.product_type_id AS savings_account_type
+    FROM credit_risk_model_conf_credit_score_parameter c
+    LEFT JOIN savings_product s ON s.id = c.savings_to_consider_id
+    WHERE c.domain_status_id = 1
+      AND (c.effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+      AND (c.end_date IS NULL OR (c.end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
+    ORDER BY c.id ASC
+    `,
+    [businessDate]
   );
   const scoreBandRes = await client.query(
     `
     SELECT * FROM credit_risk_model_conf_credit_score_band
     WHERE domain_status_id = 1
+      AND (effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+      AND (end_date IS NULL OR (end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
     ORDER BY parameter_code, project_info_id NULLS FIRST, band_seq ASC
-    `
+    `,
+    [businessDate]
   );
   const generalLoanMapRes = await client.query(
-    'SELECT loan_product_id, project_info_id FROM credit_risk_model_conf_general_loan_map WHERE domain_status_id = 1 ORDER BY loan_product_id'
+    `
+    SELECT DISTINCT loan_product_id
+    FROM credit_risk_model_conf_general_loan_map
+    WHERE domain_status_id = 1
+      AND (effective_date AT TIME ZONE 'Asia/Dhaka')::date <= $1::date
+      AND (end_date IS NULL OR (end_date AT TIME ZONE 'Asia/Dhaka')::date >= $1::date)
+    ORDER BY loan_product_id
+    `,
+    [businessDate]
   );
-  const latestRun = await loadLatestBatchRun(client, appConfig.evaluation.runId);
-
-  const snapshot = latestRun && latestRun.config_snapshot ? latestRun.config_snapshot : null;
 
   const minCycleRow = minCycleRes.rows[0] || null;
   const runningRepayRow = runningRepayRes.rows[0] || null;
@@ -137,11 +246,6 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
     generalLoanMapRes.rows.length > 0
       ? [...new Set(generalLoanMapRes.rows.map((r) => Number(r.loan_product_id)))]
       : (snapshot && snapshot.general_loan_product_ids) || DEFAULT_FALLBACK_CONFIG.general_loan_product_ids;
-
-  const businessDate =
-    appConfig.evaluation.businessDate ||
-    (snapshot && snapshot._business_date) ||
-    DEFAULT_FALLBACK_CONFIG.business_date;
 
   // Build project ceilings starting from snapshot/defaults, then overriding with live configured loan products
   const ceilingMap = new Map();
@@ -172,15 +276,15 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
     }
   }
 
-  // Extract live score parameters & bands
   const scoreParameters = paramConfRes.rows.map((r) => ({
     id: Number(r.id),
     parameterCode: r.parameter_code,
     projectInfoId: r.project_info_id !== null ? Number(r.project_info_id) : null,
     frequencyId: r.frequency_id !== null ? Number(r.frequency_id) : null,
     loanCount: r.loan_count !== null ? Number(r.loan_count) : null,
-    loanAccStatus: r.loan_acc_status,
+    loanAccStatus: normalizeLoanAccStatus(r.loan_acc_status),
     savingsToConsiderId: r.savings_to_consider_id !== null ? Number(r.savings_to_consider_id) : null,
+    savingsAccountType: r.savings_account_type !== null ? Number(r.savings_account_type) : 1,
     frequencyNoToConsider: r.frequency_no_to_consider !== null ? Number(r.frequency_no_to_consider) : null,
     daysBeforeRepayment: r.days_before_repayment !== null ? Number(r.days_before_repayment) : null
   }));
@@ -200,23 +304,31 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
         }))
       : (snapshot && snapshot.score_bands) || [];
 
-  const latestWithdrawalParam = scoreParameters.find(
+  const withdrawalParam = scoreParameters.find(
     (p) => p.parameterCode === 'SAVINGS_WITHDRAWAL_BEFORE_REPAYMENT'
   );
+
+  const minLoanCycle = minCycleRow
+    ? Number(minCycleRow.minimum_loan_cycle)
+    : (snapshot && snapshot.minimum_loan_cycle) || DEFAULT_FALLBACK_CONFIG.minimum_loan_cycle;
+  const numLoansToAvg = loanAmtRow
+    ? Number(loanAmtRow.number_of_loans_to_avg)
+    : (snapshot && snapshot.number_of_loans_to_avg) || DEFAULT_FALLBACK_CONFIG.number_of_loans_to_avg;
 
   const liveConfig = {
     source: 'LIVE_DATABASE_TABLES',
     loadedAt: new Date().toISOString(),
     business_date: businessDate,
-    minimum_loan_cycle: minCycleRow
-      ? Number(minCycleRow.minimum_loan_cycle)
-      : (snapshot && snapshot.minimum_loan_cycle) || DEFAULT_FALLBACK_CONFIG.minimum_loan_cycle,
+    toggles,
+    loan_status_ids:
+      (snapshot && snapshot.loan_status_ids) || DEFAULT_FALLBACK_CONFIG.loan_status_ids,
+    minimum_loan_cycle: minLoanCycle,
     history_years: minCycleRow
       ? Number(minCycleRow.history_years)
       : (snapshot && snapshot.history_years) || DEFAULT_FALLBACK_CONFIG.history_years,
     frequency_id: minCycleRow
       ? Number(minCycleRow.frequency_id)
-      : (snapshot && snapshot.frequency_id) || 3,
+      : (snapshot && snapshot.frequency_id) || DEFAULT_FALLBACK_CONFIG.frequency_id,
     required_paid_percentage: runningRepayRow
       ? Number(runningRepayRow.required_paid_percentage)
       : (snapshot && snapshot.required_paid_percentage) || DEFAULT_FALLBACK_CONFIG.required_paid_percentage,
@@ -229,9 +341,12 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
     due_month_evaluation_rule: dueMonthRow
       ? dueMonthRow.evaluation_rule
       : DEFAULT_FALLBACK_CONFIG.due_month_evaluation_rule,
-    number_of_loans_to_avg: loanAmtRow
-      ? Number(loanAmtRow.number_of_loans_to_avg)
-      : (snapshot && snapshot.number_of_loans_to_avg) || DEFAULT_FALLBACK_CONFIG.number_of_loans_to_avg,
+    due_month_gate_enabled: toggles.DUE_MONTH_REPAYMENT,
+    number_of_loans_to_avg: numLoansToAvg,
+    loans_to_select: toggles.LOAN_AMOUNT_CALC ? numLoansToAvg : minLoanCycle,
+    loan_amount_calc_loan_acc_status: loanAmtRow
+      ? normalizeLoanAccStatus(loanAmtRow.loan_acc_status)
+      : (snapshot && snapshot.loan_amount_calc_loan_acc_status) || 'ALL',
     eligible_loan_percentage: loanAmtRow
       ? Number(loanAmtRow.eligible_loan_percentage)
       : (snapshot && snapshot.eligible_loan_percentage) || DEFAULT_FALLBACK_CONFIG.eligible_loan_percentage,
@@ -239,11 +354,11 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
       ? Number(finalScoreRow.required_final_score)
       : (snapshot && snapshot.required_final_score) || DEFAULT_FALLBACK_CONFIG.required_final_score,
     installments_to_consider:
-      (latestWithdrawalParam && latestWithdrawalParam.frequencyNoToConsider) ||
+      (withdrawalParam && withdrawalParam.frequencyNoToConsider) ||
       (snapshot && snapshot.installments_to_consider) ||
       DEFAULT_FALLBACK_CONFIG.installments_to_consider,
     days_before_repayment:
-      (latestWithdrawalParam && latestWithdrawalParam.daysBeforeRepayment) ||
+      (withdrawalParam && withdrawalParam.daysBeforeRepayment) ||
       (snapshot && snapshot.days_before_repayment) ||
       DEFAULT_FALLBACK_CONFIG.days_before_repayment,
     general_loan_product_ids: generalLoanProductIds,
@@ -261,4 +376,4 @@ async function loadLiveAssessmentConfig(client, appConfig, configuredProducts = 
   };
 }
 
-module.exports = { loadLiveAssessmentConfig, DEFAULT_FALLBACK_CONFIG };
+module.exports = { loadLiveAssessmentConfig, DEFAULT_FALLBACK_CONFIG, normalizeLoanAccStatus };
